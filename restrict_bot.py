@@ -1,4 +1,5 @@
 import os
+import psutil # <--- NEW IMPORT
 import time
 import asyncio
 import re
@@ -146,6 +147,11 @@ app = Client(
     workers=50,
     sleep_threshold=5
 )
+
+# --- GLOBAL VARIABLES FOR STATUS ---
+BOT_START_TIME = time.time()
+ACTIVE_PROCESSES = {}
+# -----------------------------------
 
 # Initialize Global User Session (if configured)
 GlobalUserSession = None
@@ -402,6 +408,39 @@ async def send_help(client: Client, message: Message):
 async def send_cancel(client: Client, message: Message):
     batch_temp.IS_BATCH[message.from_user.id] = True
     await client.send_message(message.chat.id, "**Batch Successfully Cancelled.**")
+
+@app.on_message(filters.command(["status"]) & filters.user(ADMINS))
+async def status_style_handler(client, message):
+    # 1. Calculate Uptime
+    uptime_seconds = int(time.time() - BOT_START_TIME)
+    uptime_str = get_readable_time(uptime_seconds)
+
+    # 2. Get System Stats
+    cpu = psutil.cpu_percent()
+    mem = psutil.virtual_memory().percent
+    disk = psutil.disk_usage('.')
+    disk_total = _pretty_bytes(disk.total)
+    disk_free = _pretty_bytes(disk.free)
+
+    # 3. Build Queue Text
+    queue_text = ""
+    if not ACTIVE_PROCESSES:
+        queue_text = "\n✅ Both download and forward queues are empty.\n"
+    else:
+        queue_text += "\n⚡ **Currently Downloading:**\n"
+        for uid, info in ACTIVE_PROCESSES.items():
+            queue_text += f"👤 {info['user']} - `{info['item']}`\n"
+
+    # 4. Construct Final Message
+    msg = (
+        "📊 **Bot Status & Queue**\n"
+        f"{queue_text}\n"
+        "⌬ **Bot Stats** 🔎\n"
+        f"┟ CPU → {cpu}% | F → {disk_free}/{disk_total}\n"
+        f"┖ RAM → {mem}% | UP → {uptime_str}"
+    )
+
+    await message.reply(msg, quote=True)
 
 @app.on_message(filters.command(["botstats"]) & filters.user(ADMINS))
 async def bot_stats_handler(client: Client, message: Message):
@@ -795,15 +834,24 @@ async def start_task_final(client: Client, message_context: Message, task_data: 
 
 async def process_links_logic(client: Client, message: Message, text: str, dest_chat_id=None, dest_thread_id=None, delay=3, acc_user_id=None):
     
+    # 1. Setup User ID and Mention
     if acc_user_id:
         user_id = acc_user_id
-        user_mention = "User"
+        try: user_obj = await client.get_users(user_id)
+        except: user_obj = None
+        user_mention = user_obj.mention if user_obj else f"User({user_id})"
     elif message.from_user:
         user_id = message.from_user.id
         user_mention = message.from_user.mention
     else:
         user_id = ADMINS[0] if ADMINS else 0
         user_mention = "Channel"
+
+    # 2. Register Task for /status
+    ACTIVE_PROCESSES[user_id] = {
+        "user": user_mention,
+        "item": text[:50] + "..." if len(text) > 50 else text # Shows link initially
+    }
 
     if message.chat.type == enums.ChatType.CHANNEL:
         session_user_id = ADMINS[0] if ADMINS else 0
@@ -959,6 +1007,12 @@ async def process_links_logic(client: Client, message: Message, text: str, dest_
                 f"**ETA:** `...`",
                 reply_to_message_id=message.id
             )
+            
+            # --- UPDATE STATUS FOR /status COMMAND ---
+            # This changes the status from the raw link to a readable task name
+            if user_id in ACTIVE_PROCESSES:
+                ACTIVE_PROCESSES[user_id]["item"] = f"Batch Processing ({total_count} msgs)"
+            # -----------------------------------------
 
             if LOGIN_SYSTEM == True:
                 user_data = await db.get_session(session_user_id)
@@ -1100,12 +1154,17 @@ async def process_links_logic(client: Client, message: Message, text: str, dest_
 
         except Exception as e:
             print(f"Error in task setup: {e}")
-        
+ 
         finally:
+            # 1. Remove from Status
+            if user_id in ACTIVE_PROCESSES:
+                del ACTIVE_PROCESSES[user_id]
+
+            # 2. Existing Cleanup Logic
             batch_temp.ACTIVE_TASKS[user_id] -= 1
             if batch_temp.ACTIVE_TASKS[user_id] < 0:
-                batch_temp.ACTIVE_TASKS[user_id] = 0
-
+                batch_temp.ACTIVE_TASKS[user_id] = 0       
+        
             if batch_temp.ACTIVE_TASKS[user_id] == 0:
                 batch_temp.IS_BATCH[user_id] = False
             
