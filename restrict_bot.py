@@ -647,8 +647,10 @@ async def broadcast(bot, message):
 # 1. DIRECT LINK HANDLER (Private & Group)
 @app.on_message((filters.text | filters.caption) & (filters.private | filters.group) & ~filters.command(["dl", "start", "help", "cancel", "botstats", "login", "logout", "broadcast", "status"]))
 async def save(client: Client, message: Message):
+    # --- SAFETY CHECK: Ignore messages from Channels/Anonymous Admins ---
+    if not message.from_user:
+        return 
     user_id = message.from_user.id
-    
     # Check if user is already in a setup flow
     if user_id in PENDING_TASKS:
         if PENDING_TASKS[user_id].get("status") == "waiting_id":
@@ -1082,7 +1084,7 @@ async def process_links_logic(client: Client, message: Message, text: str, dest_
                                     # SKIP
                                     needs_retry = False
                                     # Add small sleep to prevent floodwait on large skips
-                                    await asyncio.sleep(0.1) 
+                                    await asyncio.sleep(6) 
                                     break 
                             # ---------------------------
 
@@ -1096,7 +1098,7 @@ async def process_links_logic(client: Client, message: Message, text: str, dest_
                                 except:
                                     is_success = await handle_private(client, acc, message, chatid, msgid, index, total_count, status_message, dest_chat_id, dest_thread_id, delay, user_id)
                         else:
-                             await asyncio.sleep(0.1) # Small sleep for empty msg
+                             await asyncio.sleep(6) # Small sleep for empty msg
 
                         needs_retry = False 
                     
