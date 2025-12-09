@@ -880,7 +880,7 @@ async def process_links_logic(client: Client, message: Message, text: str, dest_
     if dest_thread_id is None:
         dest_thread_id = message.message_thread_id
     
-    # --- JOIN CHAT LOGIC (Auto-Join & Process) ---
+    # --- JOIN CHAT LOGIC ---
     if ("https://t.me/+" in text or "https://t.me/joinchat/" in text):
         join_client = None
         if LOGIN_SYSTEM == True:
@@ -952,7 +952,7 @@ async def process_links_logic(client: Client, message: Message, text: str, dest_
         failed_count = 0
         total_count = 0
         status_message = None 
-        filter_thread_id = None # <--- NEW: Stores the Topic ID to filter by
+        filter_thread_id = None 
 
         if batch_temp.ACTIVE_TASKS[user_id] >= MAX_CONCURRENT_TASKS_PER_USER:
             return await message.reply_text(f"**Limit Reached:** Please wait for tasks to finish.")
@@ -967,16 +967,14 @@ async def process_links_logic(client: Client, message: Message, text: str, dest_
             clean_text = text.replace("https://", "").replace("http://", "").replace("t.me/", "").replace("c/", "")
             parts = clean_text.split("/")
             
-            # 1. Detect Topic ID in link: t.me/c/CHAT/TOPIC/MSG
+            # 1. Detect Topic ID
             if len(parts) >= 3 and parts[1].isdigit():
-                # We save this ID to filter messages later
                 filter_thread_id = int(parts[1])
             
-            # 2. Extract IDs (Start/End)
+            # 2. Extract IDs
             try:
                 last_segment = parts[-1].strip()
                 if "-" in text: 
-                    # Handle Range 
                     range_match = re.search(r"(\d+)\s*-\s*(\d+)", text)
                     if range_match:
                         fromID = int(range_match.group(1))
@@ -990,10 +988,22 @@ async def process_links_logic(client: Client, message: Message, text: str, dest_
             except Exception as e:
                 await message.reply_text(f"**Link Error:** `{e}`")
                 raise ValueError("Link parse error")
-                
-            datas = text.split("/") 
-            # --------------------------------------
+            
+            # --- OPTIMIZATION FOR TOPICS ---
+            # If requesting Topic 5000, messages 1-4999 cannot be inside it.
+            # We auto-skip to the Topic ID to prevent FloodWait loop scanning.
+            if filter_thread_id and fromID < filter_thread_id:
+                await client.send_message(
+                    message.chat.id, 
+                    f"**⚡ Auto-Optimization Triggered**\n\n"
+                    f"Requested Start: `{fromID}`\n"
+                    f"Topic Starts at: `{filter_thread_id}`\n"
+                    f"**Action:** Skipping `{fromID}-{filter_thread_id}` to avoid FloodWait."
+                )
+                fromID = filter_thread_id
+            # -------------------------------
 
+            datas = text.split("/") 
             total_count = max(1, toID - fromID + 1)
             
             status_text_header = f"**Batch Task Started!** 🚀\n"
@@ -1026,7 +1036,6 @@ async def process_links_logic(client: Client, message: Message, text: str, dest_
                 try:
                     acc = Client(":memory:", session_string=user_data, api_hash=api_hash, api_id=api_id, no_updates=True)
                     await acc.connect()
-                    # Warm up
                     async for _ in acc.get_dialogs(limit=1): pass 
                 except (AuthKeyUnregistered, UserDeactivated):
                     await message.reply("**❌ Your Session is Invalid.**\n\nI have logged you out. Please /login again.")
@@ -1070,8 +1079,10 @@ async def process_links_logic(client: Client, message: Message, text: str, dest_
                             if filter_thread_id:
                                 current_topic = msg.message_thread_id
                                 if current_topic != filter_thread_id:
-                                    # Message belongs to a different topic -> SKIP
+                                    # SKIP
                                     needs_retry = False
+                                    # Add small sleep to prevent floodwait on large skips
+                                    await asyncio.sleep(0.1) 
                                     break 
                             # ---------------------------
 
@@ -1085,8 +1096,7 @@ async def process_links_logic(client: Client, message: Message, text: str, dest_
                                 except:
                                     is_success = await handle_private(client, acc, message, chatid, msgid, index, total_count, status_message, dest_chat_id, dest_thread_id, delay, user_id)
                         else:
-                             # Message empty or deleted
-                             pass
+                             await asyncio.sleep(0.1) # Small sleep for empty msg
 
                         needs_retry = False 
                     
