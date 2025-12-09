@@ -644,22 +644,39 @@ async def broadcast(bot, message):
 # --- BOT HANDLERS: PROCESSING LINKS (CORE LOGIC) ---
 # ==============================================================================
 
-# 1. DIRECT LINK (Private Chat Only)
-@app.on_message((filters.text | filters.caption) & filters.private & ~filters.command(["dl", "start", "help", "cancel", "botstats", "login", "logout", "broadcast"]))
+# 1. DIRECT LINK HANDLER (Private & Group)
+@app.on_message((filters.text | filters.caption) & (filters.private | filters.group) & ~filters.command(["dl", "start", "help", "cancel", "botstats", "login", "logout", "broadcast", "status"]))
 async def save(client: Client, message: Message):
     user_id = message.from_user.id
-    if user_id in PENDING_TASKS and PENDING_TASKS[user_id].get("status") == "waiting_id":
-        await process_custom_destination(client, message)
-        return
-        
-    if user_id in PENDING_TASKS and PENDING_TASKS[user_id].get("status") == "waiting_speed":
-        await process_speed_input(client, message)
-        return
+    
+    # Check if user is already in a setup flow
+    if user_id in PENDING_TASKS:
+        if PENDING_TASKS[user_id].get("status") == "waiting_id":
+            await process_custom_destination(client, message)
+            return
+        if PENDING_TASKS[user_id].get("status") == "waiting_speed":
+            await process_speed_input(client, message)
+            return
 
     link_text = message.text or message.caption
     if not link_text or "https://t.me/" not in link_text:
         return 
-    
+
+    # --- GROUP MODE: Auto-Set Destination -> Ask Speed ---
+    if message.chat.type in [enums.ChatType.GROUP, enums.ChatType.SUPERGROUP]:
+        # Pre-fill the destination as THIS group/topic
+        PENDING_TASKS[user_id] = {
+            "link": link_text,
+            "dest_chat_id": message.chat.id,
+            "dest_thread_id": message.message_thread_id,
+            "dest_title": message.chat.title or "This Group",
+            "status": "waiting_speed" 
+        }
+        # Skip "Where to send?" and go straight to "How fast?"
+        await ask_for_speed(message)
+        return
+
+    # --- PRIVATE MODE: Ask Destination First ---
     PENDING_TASKS[user_id] = {"link": link_text, "status": "waiting_choice"}
     
     buttons = [
@@ -850,7 +867,7 @@ async def process_links_logic(client: Client, message: Message, text: str, dest_
     # 2. Register Task for /status
     ACTIVE_PROCESSES[user_id] = {
         "user": user_mention,
-        "item": text[:50] + "..." if len(text) > 50 else text # Shows link initially
+        "item": text[:50] + "..." if len(text) > 50 else text 
     }
 
     if message.chat.type == enums.ChatType.CHANNEL:
@@ -866,8 +883,6 @@ async def process_links_logic(client: Client, message: Message, text: str, dest_
     # --- JOIN CHAT LOGIC (Auto-Join & Process) ---
     if ("https://t.me/+" in text or "https://t.me/joinchat/" in text):
         join_client = None
-        
-        # 1. Setup the Client (User Session)
         if LOGIN_SYSTEM == True:
             user_data = await db.get_session(session_user_id)
             if user_data is None:
@@ -887,16 +902,12 @@ async def process_links_logic(client: Client, message: Message, text: str, dest_
                 return
             join_client = GlobalUserSession 
 
-        # 2. Attempt to Join or Resolve
         chat_info = None
         try:
             try: 
-                # Try to join the chat
                 chat_info = await join_client.join_chat(text)
                 await message.reply(f"**✅ Joined Chat:** `{chat_info.title}`\n**Analyzing messages...**")
-            
             except UserAlreadyParticipant:
-                # If already joined, use check_chat_invite_link to get the ID from the link
                 try:
                     invite_check = await join_client.check_chat_invite_link(text)
                     chat_info = invite_check.chat
@@ -904,7 +915,6 @@ async def process_links_logic(client: Client, message: Message, text: str, dest_
                 except Exception:
                     await message.reply("**❌ Already in chat, but couldn't resolve Link.**\nPlease send a post link from inside the chat instead.")
                     return
-
             except InviteHashExpired: 
                 await client.send_message(message.chat.id, "❌ **Invalid / Expired Link**")
                 return
@@ -912,42 +922,23 @@ async def process_links_logic(client: Client, message: Message, text: str, dest_
                 await client.send_message(message.chat.id, f"**Join Error:** {e}")
                 return
             
-            # 3. Analyze Chat to Create Virtual Link
             if chat_info:
                 target_chat_id = chat_info.id
-                
-                # Get the VERY LAST message ID in the chat
                 last_msg_id = 0
                 async for msg in join_client.get_chat_history(target_chat_id, limit=1):
                     last_msg_id = msg.id
                 
                 if last_msg_id > 0:
-                    # Construct the format: https://t.me/c/CHATID/1-LASTID
-                    # We strip the "-100" from the ID for the link format standard
                     chat_id_clean = str(target_chat_id).replace("-100", "")
-                    
                     virtual_link = f"https://t.me/c/{chat_id_clean}/1-{last_msg_id}"
-                    
                     await message.reply(f"**🔄 Auto-Processing:**\nFound {last_msg_id} messages.\nStarting Batch Task...")
                     
-                    # 4. RECURSIVE CALL: Feed this virtual link back into the main function
-                    await process_links_logic(
-                        client, 
-                        message, 
-                        virtual_link, 
-                        dest_chat_id=dest_chat_id, 
-                        dest_thread_id=dest_thread_id, 
-                        delay=delay, 
-                        acc_user_id=acc_user_id
-                    )
+                    await process_links_logic(client, message, virtual_link, dest_chat_id=dest_chat_id, dest_thread_id=dest_thread_id, delay=delay, acc_user_id=acc_user_id)
                 else:
                     await message.reply("**❌ Chat seems empty.**")
-
         except Exception as e: 
             await client.send_message(message.chat.id, f"**Error:** {e}")
-        
         finally:
-            # Cleanup temporary client
             if LOGIN_SYSTEM == True and join_client and join_client.is_connected: 
                  try: await join_client.stop() 
                  except: pass
@@ -961,13 +952,10 @@ async def process_links_logic(client: Client, message: Message, text: str, dest_
         failed_count = 0
         total_count = 0
         status_message = None 
+        filter_thread_id = None # <--- NEW: Stores the Topic ID to filter by
 
         if batch_temp.ACTIVE_TASKS[user_id] >= MAX_CONCURRENT_TASKS_PER_USER:
-            return await message.reply_text(
-                f"**You already have {batch_temp.ACTIVE_TASKS[user_id]} tasks running.**\n\n"
-                f"Please wait for one to finish before starting a new one. "
-                f"The limit is {MAX_CONCURRENT_TASKS_PER_USER} simultaneous tasks."
-            )
+            return await message.reply_text(f"**Limit Reached:** Please wait for tasks to finish.")
         
         batch_temp.ACTIVE_TASKS[user_id] += 1
         batch_temp.IS_BATCH[user_id] = False
@@ -975,31 +963,48 @@ async def process_links_logic(client: Client, message: Message, text: str, dest_
         try:
             was_cancelled = False 
             
-            # --- Robust Regex Parsing ---
-            match = re.search(r"(?:https?://)?t\.me/(?:c/)?([\w\d_]+)/(\d+)(?:\s*-\s*(\d+))?", text)
+            # --- STRICT TOPIC PARSING LOGIC ---
+            clean_text = text.replace("https://", "").replace("http://", "").replace("t.me/", "").replace("c/", "")
+            parts = clean_text.split("/")
             
-            if not match:
-                await message.reply_text("**Invalid Post Link format.**")
-                raise ValueError("Invalid link, stopping task.")
+            # 1. Detect Topic ID in link: t.me/c/CHAT/TOPIC/MSG
+            if len(parts) >= 3 and parts[1].isdigit():
+                # We save this ID to filter messages later
+                filter_thread_id = int(parts[1])
+            
+            # 2. Extract IDs (Start/End)
+            try:
+                last_segment = parts[-1].strip()
+                if "-" in text: 
+                    # Handle Range 
+                    range_match = re.search(r"(\d+)\s*-\s*(\d+)", text)
+                    if range_match:
+                        fromID = int(range_match.group(1))
+                        toID = int(range_match.group(2))
+                    else:
+                        fromID = int(last_segment)
+                        toID = fromID
+                else:
+                    fromID = int(last_segment)
+                    toID = fromID
+            except Exception as e:
+                await message.reply_text(f"**Link Error:** `{e}`")
+                raise ValueError("Link parse error")
                 
-            chat_identifier = match.group(1) 
-            fromID = int(match.group(2))
-            
-            if match.group(3):
-                toID = int(match.group(3))
-            else:
-                toID = fromID
-            
             datas = text.split("/") 
             # --------------------------------------
 
             total_count = max(1, toID - fromID + 1)
+            
+            status_text_header = f"**Batch Task Started!** 🚀\n"
+            if filter_thread_id:
+                status_text_header += f"**Filter:** `Topic {filter_thread_id} Only` 🎯\n"
 
             start_time = time.time()
             last_update_time = start_time
             status_message = await client.send_message(
                 message.chat.id,
-                f"**Batch Task Started!** 🚀\n\n"
+                f"{status_text_header}\n"
                 f"**Total:** `{total_count}`\n"
                 f"**Processed:** `0`\n"
                 f"**Success:** `0`\n"
@@ -1008,11 +1013,8 @@ async def process_links_logic(client: Client, message: Message, text: str, dest_
                 reply_to_message_id=message.id
             )
             
-            # --- UPDATE STATUS FOR /status COMMAND ---
-            # This changes the status from the raw link to a readable task name
             if user_id in ACTIVE_PROCESSES:
                 ACTIVE_PROCESSES[user_id]["item"] = f"Batch Processing ({total_count} msgs)"
-            # -----------------------------------------
 
             if LOGIN_SYSTEM == True:
                 user_data = await db.get_session(session_user_id)
@@ -1024,13 +1026,8 @@ async def process_links_logic(client: Client, message: Message, text: str, dest_
                 try:
                     acc = Client(":memory:", session_string=user_data, api_hash=api_hash, api_id=api_id, no_updates=True)
                     await acc.connect()
-                    
-                    # Session Refresh (Warm-up)
-                    print(f"Warming up session cache for ID {session_user_id}...")
-                    async for _ in acc.get_dialogs(limit=1):
-                        pass 
-                    print("Session cache is warm.")
-                    
+                    # Warm up
+                    async for _ in acc.get_dialogs(limit=1): pass 
                 except (AuthKeyUnregistered, UserDeactivated):
                     await message.reply("**❌ Your Session is Invalid.**\n\nI have logged you out. Please /login again.")
                     await db.delete_user(session_user_id)
@@ -1042,11 +1039,9 @@ async def process_links_logic(client: Client, message: Message, text: str, dest_
                 if GlobalUserSession is None: 
                     await client.send_message(message.chat.id, f"**String Session is not Set**")
                     raise ValueError("String session not set, stopping task.")
-                
                 if batch_temp.ACTIVE_TASKS[user_id] > 1:
                     await client.send_message(message.chat.id, f"**Concurrent tasks are not supported when using the bot's global session.**")
                     raise ValueError("Global session cannot be used concurrently.")
-                
                 acc = GlobalUserSession
             
             for index, msgid in enumerate(range(fromID, toID+1), start=1):
@@ -1055,71 +1050,50 @@ async def process_links_logic(client: Client, message: Message, text: str, dest_
                     break 
                 
                 needs_retry = True
-                
                 while needs_retry:
                     is_success = False 
-                    
                     try:
                         if "https://t.me/c/" in text:
-                            chatid = int("-100" + datas[4])
-                            try: 
-                                is_success = await handle_private(client, acc, message, chatid, msgid, index, total_count, status_message, dest_chat_id, dest_thread_id, delay, user_id)
-                            except Exception as e: 
-                                if ERROR_MESSAGE: await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
-
-                        elif "https.t.me/b/" in text:
-                            username = datas[4]
-                            try: 
-                                is_success = await handle_private(client, acc, message, username, msgid, index, total_count, status_message, dest_chat_id, dest_thread_id, delay, user_id)
-                            except Exception as e: 
-                                if ERROR_MESSAGE: await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
-
+                            chatid = int("-100" + parts[0]) 
+                            if not parts[0].isdigit(): chatid = int("-100" + datas[4]) 
                         else:
-                            username = datas[3]
-                            try: msg = await client.get_messages(username, msgid)
-                            except: 
-                                await client.send_message(message.chat.id, "Username not occupied")
-                                needs_retry = False
-                                is_success = False
-                                continue 
-                                
-                            try:
-                                await client.copy_message(dest_chat_id, msg.chat.id, msg.id, message_thread_id=dest_thread_id)
-                                is_success = True 
-                                await asyncio.sleep(delay)
-                            except:
-                                try: 
-                                    is_success = await handle_private(client, acc, message, username, msgid, index, total_count, status_message, dest_chat_id, dest_thread_id, delay, user_id)
-                                except Exception as e: 
-                                    if ERROR_MESSAGE: await client.send_message(message.chat.id, f"Error: {e}", reply_to_message_id=message.id)
+                            chatid = parts[0]
+
+                        # Fetch Message
+                        try:
+                            msg = await acc.get_messages(chatid, msgid)
+                        except:
+                            msg = None
                         
+                        if msg and not msg.empty:
+                            # --- STRICT TOPIC FILTER ---
+                            if filter_thread_id:
+                                current_topic = msg.message_thread_id
+                                if current_topic != filter_thread_id:
+                                    # Message belongs to a different topic -> SKIP
+                                    needs_retry = False
+                                    break 
+                            # ---------------------------
+
+                            if "https://t.me/c/" in text:
+                                is_success = await handle_private(client, acc, message, chatid, msgid, index, total_count, status_message, dest_chat_id, dest_thread_id, delay, user_id)
+                            else:
+                                try:
+                                    await client.copy_message(dest_chat_id, msg.chat.id, msg.id, message_thread_id=dest_thread_id)
+                                    is_success = True 
+                                    await asyncio.sleep(delay)
+                                except:
+                                    is_success = await handle_private(client, acc, message, chatid, msgid, index, total_count, status_message, dest_chat_id, dest_thread_id, delay, user_id)
+                        else:
+                             # Message empty or deleted
+                             pass
+
                         needs_retry = False 
                     
                     except FloodWait as e:
-                        print(f"FloodWait: Sleeping for {e.value + 6} seconds.")
-                        if status_message:
-                            try:
-                                await status_message.edit_text(
-                                    f"**FloodWait Detected!** 🛑\n\n"
-                                    f"Sleeping for **{get_readable_time(e.value + 6)}** and then retrying..."
-                                )
-                            except: pass
                         await asyncio.sleep(e.value + 6)
-                    
-                    except FileReferenceExpired:
-                        print(f"File Reference Expired for msg {msgid}. Retrying after 5s.")
-                        if status_message:
-                            try:
-                                await client.edit_message_text(
-                                    status_message.chat.id, status_message.id,
-                                    f"**File Reference Expired!** ⚠️\n\n"
-                                    f"Retrying message `{msgid}` in 5 seconds..."
-                                )
-                            except: pass
-                        await asyncio.sleep(5)
-                    
                     except Exception as loop_e:
-                        print(f"An unexpected error in the loop: {loop_e}")
+                        print(f"Loop Error: {loop_e}")
                         is_success = False
                         needs_retry = False 
 
@@ -1139,10 +1113,9 @@ async def process_links_logic(client: Client, message: Message, text: str, dest_
                         eta_str = get_readable_time(int(eta_seconds))
                     else:
                         eta_str = "..."
-
                     try:
                         await status_message.edit_text(
-                            f"**Batch Task Running...** ⏳\n\n"
+                            f"{status_text_header}\n"
                             f"**Total:** `{total_count}`\n"
                             f"**Processed:** `{index}`\n"
                             f"**Success:** `{success_count}`\n"
@@ -1150,28 +1123,24 @@ async def process_links_logic(client: Client, message: Message, text: str, dest_
                             f"**ETA:** `{eta_str}`"
                         )
                     except Exception as e:
-                        print(f"Error updating status message: {e}") 
+                        print(f"Error updating status: {e}") 
 
         except Exception as e:
             print(f"Error in task setup: {e}")
  
         finally:
-            # 1. Remove from Status
             if user_id in ACTIVE_PROCESSES:
                 del ACTIVE_PROCESSES[user_id]
 
-            # 2. Existing Cleanup Logic
             batch_temp.ACTIVE_TASKS[user_id] -= 1
             if batch_temp.ACTIVE_TASKS[user_id] < 0:
                 batch_temp.ACTIVE_TASKS[user_id] = 0       
-        
             if batch_temp.ACTIVE_TASKS[user_id] == 0:
                 batch_temp.IS_BATCH[user_id] = False
             
             if LOGIN_SYSTEM == True and acc:
                 try: 
-                    if acc.is_connected:
-                        await acc.stop()
+                    if acc.is_connected: await acc.stop()
                 except: pass
             
             if was_cancelled:
@@ -1198,8 +1167,7 @@ async def process_links_logic(client: Client, message: Message, text: str, dest_
                 except: pass
             
             if status_message:
-                try:
-                    await status_message.delete()
+                try: await status_message.delete()
                 except: pass 
 
 async def handle_private(client: Client, acc, message: Message, chatid, msgid: int, index: int, total_count: int, status_message: Message, dest_chat_id, dest_thread_id, delay, user_id):
