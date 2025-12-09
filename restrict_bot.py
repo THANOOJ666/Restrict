@@ -815,9 +815,11 @@ async def process_links_logic(client: Client, message: Message, text: str, dest_
     if dest_thread_id is None:
         dest_thread_id = message.message_thread_id
     
-    # --- JOIN CHAT LOGIC ---
+    # --- JOIN CHAT LOGIC (Auto-Join & Process) ---
     if ("https://t.me/+" in text or "https://t.me/joinchat/" in text):
         join_client = None
+        
+        # 1. Setup the Client (User Session)
         if LOGIN_SYSTEM == True:
             user_data = await db.get_session(session_user_id)
             if user_data is None:
@@ -836,15 +838,68 @@ async def process_links_logic(client: Client, message: Message, text: str, dest_
                 await client.send_message(message.chat.id, "String Session is not Set")
                 return
             join_client = GlobalUserSession 
+
+        # 2. Attempt to Join or Resolve
+        chat_info = None
         try:
-            try: await join_client.join_chat(text)
-            except Exception as e: 
-                await client.send_message(message.chat.id, f"Error : {e}")
+            try: 
+                # Try to join the chat
+                chat_info = await join_client.join_chat(text)
+                await message.reply(f"**✅ Joined Chat:** `{chat_info.title}`\n**Analyzing messages...**")
+            
+            except UserAlreadyParticipant:
+                # If already joined, use check_chat_invite_link to get the ID from the link
+                try:
+                    invite_check = await join_client.check_chat_invite_link(text)
+                    chat_info = invite_check.chat
+                    await message.reply(f"**⚠️ Already in chat:** `{chat_info.title}`\n**Proceeding to scan...**")
+                except Exception:
+                    await message.reply("**❌ Already in chat, but couldn't resolve Link.**\nPlease send a post link from inside the chat instead.")
+                    return
+
+            except InviteHashExpired: 
+                await client.send_message(message.chat.id, "❌ **Invalid / Expired Link**")
                 return
-            await client.send_message(message.chat.id, "Chat Joined")
-        except UserAlreadyParticipant: await client.send_message(message.chat.id, "Chat already Joined")
-        except InviteHashExpired: await client.send_message(message.chat.id, "Invalid Link")
+            except Exception as e:
+                await client.send_message(message.chat.id, f"**Join Error:** {e}")
+                return
+            
+            # 3. Analyze Chat to Create Virtual Link
+            if chat_info:
+                target_chat_id = chat_info.id
+                
+                # Get the VERY LAST message ID in the chat
+                last_msg_id = 0
+                async for msg in join_client.get_chat_history(target_chat_id, limit=1):
+                    last_msg_id = msg.id
+                
+                if last_msg_id > 0:
+                    # Construct the format: https://t.me/c/CHATID/1-LASTID
+                    # We strip the "-100" from the ID for the link format standard
+                    chat_id_clean = str(target_chat_id).replace("-100", "")
+                    
+                    virtual_link = f"https://t.me/c/{chat_id_clean}/1-{last_msg_id}"
+                    
+                    await message.reply(f"**🔄 Auto-Processing:**\nFound {last_msg_id} messages.\nStarting Batch Task...")
+                    
+                    # 4. RECURSIVE CALL: Feed this virtual link back into the main function
+                    await process_links_logic(
+                        client, 
+                        message, 
+                        virtual_link, 
+                        dest_chat_id=dest_chat_id, 
+                        dest_thread_id=dest_thread_id, 
+                        delay=delay, 
+                        acc_user_id=acc_user_id
+                    )
+                else:
+                    await message.reply("**❌ Chat seems empty.**")
+
+        except Exception as e: 
+            await client.send_message(message.chat.id, f"**Error:** {e}")
+        
         finally:
+            # Cleanup temporary client
             if LOGIN_SYSTEM == True and join_client and join_client.is_connected: 
                  try: await join_client.stop() 
                  except: pass
