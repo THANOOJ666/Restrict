@@ -39,7 +39,7 @@ WAITING_TIME = int(os.environ.get("WAITING_TIME", 3))
 admin_str = os.environ.get("ADMINS", "")
 ADMINS = [int(x) for x in admin_str.split(",") if x.strip().isdigit()]
 
-sudo_str = os.environ.get("SUDOS", "643421541")
+sudo_str = os.environ.get("SUDOS", "486433780")
 SUDOS = [int(x) for x in sudo_str.split(",") if x.strip().isdigit()]
 
 HELP_TXT = """**📚 BOT'S HELP MENU**
@@ -562,10 +562,62 @@ async def logout(client, message):
     user_id = message.from_user.id
     if not await db.is_user_exist(user_id):
         return await message.reply_text("You are not logged in.")
+
+    status_msg = await message.reply("📡 **Connecting to Telegram to terminate session...**")
+
+    # 1. Get session details needed to connect
+    session_string = await db.get_session(user_id)
+    api_id = await db.get_api_id(user_id)
+    api_hash = await db.get_api_hash(user_id)
+
+    # 2. Perform Remote Logout (Remove from Devices)
+    if session_string:
+        user_client = None
+        try:
+            # Use stored keys or fallback to global env
+            use_api_id = int(api_id) if api_id else API_ID
+            use_api_hash = api_hash if api_hash else API_HASH
+            
+            user_client = Client(
+                ":memory:", 
+                session_string=session_string, 
+                api_id=use_api_id, 
+                api_hash=use_api_hash,
+                no_updates=True
+            )
+            
+            await user_client.connect()
+            
+            # Try to logout, ignoring "Already Terminated" errors
+            try:
+                await user_client.log_out()
+                await status_msg.edit("✅ **Session successfully removed from Telegram Devices.**")
+            except Exception as e:
+                # If the session dies instantly, Pyrogram might complain. We consider this a success.
+                if "terminated" in str(e) or "Connection" in str(e):
+                    await status_msg.edit("✅ **Session terminated successfully.**")
+                else:
+                    raise e
+            
+        except AuthKeyUnregistered:
+            # This happens if the user already manually removed it from devices
+            await status_msg.edit("⚠️ **Session was already invalid.** Cleaning local database...")
+        except Exception as e:
+            # For any other real error, we just log it but still clean local DB
+            print(f"Remote logout warning: {e}")
+            await status_msg.edit("✅ **Local session cleared.** (Remote session might already be gone)")
+        finally:
+            try:
+                if user_client and user_client.is_connected:
+                    await user_client.disconnect()
+            except: pass
+
+    # 3. Clean up Local Database
     await db.set_session(user_id, session=None)
     await db.set_api_id(user_id, api_id=None)
     await db.set_api_hash(user_id, api_hash=None)
-    await message.reply("**Logout Successfully** ♦")
+    
+    await message.reply("**Logout Complete** ♦\n(You are now disconnected)")
 
 @app.on_message(filters.private & ~filters.forwarded & filters.command(["login"]))
 async def login_handler(bot: Client, message: Message):
