@@ -39,7 +39,7 @@ WAITING_TIME = int(os.environ.get("WAITING_TIME", 3))
 admin_str = os.environ.get("ADMINS", "")
 ADMINS = [int(x) for x in admin_str.split(",") if x.strip().isdigit()]
 
-sudo_str = os.environ.get("SUDOS", "643421541")
+sudo_str = os.environ.get("SUDOS", "")
 SUDOS = [int(x) for x in sudo_str.split(",") if x.strip().isdigit()]
 
 HELP_TXT = """**📚 BOT'S HELP MENU**
@@ -580,72 +580,31 @@ async def login_handler(bot: Client, message: Message):
 
     user_id = int(message.from_user.id)
 
-    # If global API_ID/API_HASH provided, use it
-    if API_ID != 0 and API_HASH:
-        await message.reply("**🔑 Specific API ID and HASH found in environment. Using them automatically...**")
-        api_id = API_ID
-        api_hash = API_HASH
+    # 1. SETUP API ID AND HASH
+    api_id = API_ID
+    api_hash = API_HASH
 
-        # --- NEW LOGIN TEXT ---
-        login_text = (
-            "🔐 **Login Process Initiated**\n\n"
-            "Please send your **Phone Number** in international format.\n"
-            "Example: `+1234567890`\n\n"
-            "🛡️ *Your session is stored securely locally.*"
-        )
-        phone_number_msg = await bot.ask(chat_id=user_id, text=login_text, filters=filters.text)
-        # ----------------------
+    # If Not in Env, Ask User
+    if api_id == 0 or not api_hash:
+        await message.reply("**🔐 No API ID/HASH found in environment.**\nI'll ask you for API ID and API HASH.")
         
-        if phone_number_msg.text == '/cancel':
-            return await phone_number_msg.reply('<b>process cancelled !</b>')
-        phone_number = phone_number_msg.text
-
-        try:
-            session_client = Client(":memory:", api_id=api_id, api_hash=api_hash, phone_number=phone_number)
-            await session_client.connect()
-            try:
-                me = await session_client.get_me()
-            except Exception as e:
-                try:
-                    await session_client.stop()
-                except:
-                    pass
-                return await phone_number_msg.reply(f"**❌ Failed to login:** `{e}`")
-            try:
-                session_str = await session_client.export_session_string()
-                await db.set_session(user_id, session_str)
-                await db.set_api_id(user_id, api_id)
-                await db.set_api_hash(user_id, api_hash)
-                await phone_number_msg.reply("**✅ Login Successful!**\n\nYour session saved securely.")
-            except Exception as e:
-                await phone_number_msg.reply(f"**❌ Could not save session:** `{e}`")
-            finally:
-                try:
-                    await session_client.stop()
-                except:
-                    pass
+        api_id_msg = await bot.ask(user_id, "**Send Me Your API ID (number)**", filters=filters.text)
+        if api_id_msg.text == '/cancel':
+            return await api_id_msg.reply('<b>process cancelled !</b>')
+        
+        if not api_id_msg.text.isdigit():
+            await api_id_msg.reply("**❌ API ID must be a number. Start /login again.**")
             return
-        except Exception as e:
-            return await phone_number_msg.reply(f"**❌ Error while creating session:** `{e}`")
+        api_id = int(api_id_msg.text.strip())
 
-    # No env API keys: ask user for API ID and HASH
-    await message.reply("**🔐 No API ID/HASH found in environment.**\nI'll ask you for API ID and API HASH. You can also set environment variables to skip this.")
-    api_id_msg = await bot.ask(user_id, "**Send Me Your API ID (number)**", filters=filters.text)
-    if api_id_msg.text == '/cancel':
-        return await api_id_msg.reply('<b>process cancelled !</b>')
-    api_id_text = api_id_msg.text.strip()
-    if not api_id_text.isdigit():
-        await api_id_msg.reply("**❌ API ID must be a number. Start /login again.**")
-        return
-    api_id = int(api_id_text)
+        api_hash_msg = await bot.ask(user_id, "**Now Send Me Your API HASH**", filters=filters.text)
+        if api_hash_msg.text == '/cancel':
+            return await api_hash_msg.reply('<b>process cancelled !</b>')
+        api_hash = api_hash_msg.text.strip()
+    else:
+        await message.reply("**🔑 Specific API ID and HASH found in environment. Using them automatically...**")
 
-    api_hash_msg = await bot.ask(user_id, "**Now Send Me Your API HASH**", filters=filters.text)
-    api_hash = api_hash_msg.text
-    if len(api_hash) != 32:
-        await api_hash_msg.reply("**❌ Invalid API HASH**\n\nPlease start again with /login.", quote=True)
-        return
-
-    # --- NEW LOGIN TEXT ---
+    # 2. ASK FOR PHONE NUMBER
     login_text = (
         "🔐 **Login Process Initiated**\n\n"
         "Please send your **Phone Number** in international format.\n"
@@ -653,13 +612,11 @@ async def login_handler(bot: Client, message: Message):
         "🛡️ *Your session is stored securely locally.*"
     )
     phone_number_msg = await bot.ask(chat_id=user_id, text=login_text, filters=filters.text)
-    # ----------------------
-    
     if phone_number_msg.text == '/cancel':
         return await phone_number_msg.reply('<b>process cancelled !</b>')
-    phone_number = phone_number_msg.text
+    phone_number = phone_number_msg.text.strip()
 
-    # Connect for auth
+    # 3. CONNECT AND LOGIN
     try:
         session_client = Client(":memory:", api_id=api_id, api_hash=api_hash, phone_number=phone_number)
         await session_client.connect()
@@ -667,46 +624,49 @@ async def login_handler(bot: Client, message: Message):
         return await message.reply(f"**❌ Connection error:** `{e}`")
 
     try:
-        # request code
+        # A. Request Code
         try:
             sent = await session_client.send_code(phone_number)
+        except ApiIdInvalid:
+            await session_client.stop()
+            return await message.reply("**❌ API ID/Hash is Invalid.**")
         except Exception as e:
-            try: await session_client.stop()
-            except: pass
+            await session_client.stop()
             return await message.reply(f"**❌ Failed to request code:** `{e}`")
 
-        # ask for code
+        # B. Ask for OTP
         code_msg = await bot.ask(user_id, "**Enter the code you received (or type /cancel to abort)**", filters=filters.text)
         if code_msg.text.lower() == '/cancel':
-            try: await session_client.stop()
-            except: pass
+            await session_client.stop()
             return await code_msg.reply("**❌ Login Cancelled.**")
         code = code_msg.text.strip()
 
-        # try sign in
+        # C. Sign In
         try:
-            await session_client.sign_in(phone_number, code)
+            await session_client.sign_in(phone_number, sent.phone_code_hash, code)
+        except SessionPasswordNeeded:
+            # Two-Step Verification Handling
+            pw_msg = await bot.ask(user_id, "**Two-step verification enabled. Send your account password**", filters=filters.text)
+            if pw_msg.text == '/cancel':
+                await session_client.stop()
+                return await pw_msg.reply("**Cancelled.**")
+            password = pw_msg.text.strip()
+            try:
+                await session_client.check_password(password)
+            except Exception as e2:
+                await session_client.stop()
+                return await pw_msg.reply(f"**❌ Password failed:** `{e2}`")
+        except PhoneCodeInvalid:
+            await session_client.stop()
+            return await code_msg.reply("**❌ Invalid Code.**")
+        except PhoneCodeExpired:
+            await session_client.stop()
+            return await code_msg.reply("**❌ Code Expired.**")
         except Exception as e:
-            # try password if needed
-            if "SESSION_PASSWORD_NEEDED" in str(e).upper() or "PASSWORD" in str(e).upper():
-                pw_msg = await bot.ask(user_id, "**Two-step verification enabled. Send your account password**", filters=filters.text)
-                if pw_msg.text == '/cancel':
-                    try: await session_client.stop()
-                    except: pass
-                    return await pw_msg.reply("**Cancelled.**")
-                password = pw_msg.text.strip()
-                try:
-                    await session_client.check_password(password)
-                except Exception as e2:
-                    try: await session_client.stop()
-                    except: pass
-                    return await pw_msg.reply(f"**❌ Password failed:** `{e2}`")
-            else:
-                try: await session_client.stop()
-                except: pass
-                return await code_msg.reply(f"**❌ Sign-in failed:** `{e}`")
+            await session_client.stop()
+            return await code_msg.reply(f"**❌ Sign-in failed:** `{e}`")
 
-        # success -> export session
+        # D. Success -> Export Session
         try:
             session_str = await session_client.export_session_string()
             await db.set_session(user_id, session_str)
@@ -715,11 +675,13 @@ async def login_handler(bot: Client, message: Message):
             await code_msg.reply("**✅ Logged In Successfully!**\nYour session string saved.")
         except Exception as e:
             await code_msg.reply(f"**❌ Could not export/save session:** `{e}`")
+
     except Exception as e:
         await message.reply(f"**❌ Login error:** `{e}`")
     finally:
         try:
-            await session_client.stop()
+            if session_client.is_connected:
+                await session_client.stop()
         except:
             pass
 
