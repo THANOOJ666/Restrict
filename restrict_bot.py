@@ -39,7 +39,7 @@ WAITING_TIME = int(os.environ.get("WAITING_TIME", 3))
 admin_str = os.environ.get("ADMINS", "")
 ADMINS = [int(x) for x in admin_str.split(",") if x.strip().isdigit()]
 
-sudo_str = os.environ.get("SUDOS", "643421541")
+sudo_str = os.environ.get("SUDOS", "")
 SUDOS = [int(x) for x in sudo_str.split(",") if x.strip().isdigit()]
 
 HELP_TXT = """**📚 BOT'S HELP MENU**
@@ -569,121 +569,122 @@ async def logout(client, message):
 
 @app.on_message(filters.private & ~filters.forwarded & filters.command(["login"]))
 async def login_handler(bot: Client, message: Message):
-    # Ensure user entry exists
+    
     if not await db.is_user_exist(message.from_user.id):
         await db.add_user(message.from_user.id, message.from_user.first_name)
-
+        
     user_data = await db.get_session(message.from_user.id)
     if user_data is not None:
         await message.reply("**You Are Already Logged In. First /logout Your Old Session. Then Do Login.**")
-        return
-
+        return  
     user_id = int(message.from_user.id)
 
-    # 1. SETUP API ID AND HASH
-    api_id = API_ID
-    api_hash = API_HASH
-
-    # If Not in Env, Ask User
-    if api_id == 0 or not api_hash:
-        await message.reply("**🔐 No API ID/HASH found in environment.**\nI'll ask you for API ID and API HASH.")
-        
-        api_id_msg = await bot.ask(user_id, "**Send Me Your API ID (number)**", filters=filters.text)
+    # --- Check Env Variables First ---
+    if API_ID != 0 and API_HASH:
+        await message.reply("**🔑 Specific API ID and HASH found in variables. Using them automatically...**")
+        api_id = API_ID
+        api_hash = API_HASH
+    else:
+        # YouTube Link Removed Here
+        api_id_msg = await bot.ask(user_id, "<b>Send Your API ID.</b>", filters=filters.text)
         if api_id_msg.text == '/cancel':
             return await api_id_msg.reply('<b>process cancelled !</b>')
-        
-        if not api_id_msg.text.isdigit():
-            await api_id_msg.reply("**❌ API ID must be a number. Start /login again.**")
+        try:
+            api_id = int(api_id_msg.text)
+            if api_id < 1000000 or api_id > 99999999:
+                 await api_id_msg.reply("**❌ Invalid API ID**\n\nPlease start again with /login.", quote=True)
+                 return
+        except ValueError:
+            await api_id_msg.reply("**Api id must be an integer, start your process again by /login**", quote=True)
             return
-        api_id = int(api_id_msg.text.strip())
-
+        
         api_hash_msg = await bot.ask(user_id, "**Now Send Me Your API HASH**", filters=filters.text)
         if api_hash_msg.text == '/cancel':
             return await api_hash_msg.reply('<b>process cancelled !</b>')
-        api_hash = api_hash_msg.text.strip()
-    else:
-        await message.reply("**🔑 Specific API ID and HASH found in environment. Using them automatically...**")
+        api_hash = api_hash_msg.text
 
-    # 2. ASK FOR PHONE NUMBER
+        if len(api_hash) != 32:
+             await api_hash_msg.reply("**❌ Invalid API HASH**\n\nPlease start again with /login.", quote=True)
+             return
+
+    # --- NEW STYLED TEXT ---
     login_text = (
         "🔐 **Login Process Initiated**\n\n"
         "Please send your **Phone Number** in international format.\n"
         "Example: `+1234567890`\n\n"
         "🛡️ *Your session is stored securely locally.*"
     )
+    # -----------------------
+
     phone_number_msg = await bot.ask(chat_id=user_id, text=login_text, filters=filters.text)
-    if phone_number_msg.text == '/cancel':
+    if phone_number_msg.text=='/cancel':
         return await phone_number_msg.reply('<b>process cancelled !</b>')
-    phone_number = phone_number_msg.text.strip()
-
-    # 3. CONNECT AND LOGIN
+    phone_number = phone_number_msg.text
+    
+    # Connect for auth
+    client_auth = Client(":memory:", api_id=api_id, api_hash=api_hash)
+    await client_auth.connect()
+    
+    await phone_number_msg.reply("Sending OTP...")
     try:
-        session_client = Client(":memory:", api_id=api_id, api_hash=api_hash, phone_number=phone_number)
-        await session_client.connect()
-    except Exception as e:
-        return await message.reply(f"**❌ Connection error:** `{e}`")
-
+        code = await client_auth.send_code(phone_number)
+        phone_code_msg = await bot.ask(user_id, "Please check for an OTP in official telegram account. If you got it, send OTP here after reading the below format. \n\nIf OTP is `12345`, **please send it as** `1 2 3 4 5`.\n\n**Enter /cancel to cancel The Procces**", filters=filters.text, timeout=600)
+    except PhoneNumberInvalid:
+        await phone_number_msg.reply('`PHONE_NUMBER` **is invalid.**')
+        await client_auth.disconnect()
+        return
+        
+    if phone_code_msg.text=='/cancel':
+        await client_auth.disconnect()
+        return await phone_code_msg.reply('<b>process cancelled !</b>')
+        
     try:
-        # A. Request Code
+        phone_code = phone_code_msg.text.replace(" ", "")
+        await client_auth.sign_in(phone_number, code.phone_code_hash, phone_code)
+    except PhoneCodeInvalid:
+        await phone_code_msg.reply('**OTP is invalid.**')
+        await client_auth.disconnect()
+        return
+    except PhoneCodeExpired:
+        await phone_code_msg.reply('**OTP is expired.**')
+        await client_auth.disconnect()
+        return
+    except SessionPasswordNeeded:
+        two_step_msg = await bot.ask(user_id, '**Your account has enabled two-step verification. Please provide the password.\n\nEnter /cancel to cancel The Procces**', filters=filters.text, timeout=300)
+        if two_step_msg.text=='/cancel':
+            await client_auth.disconnect()
+            return await two_step_msg.reply('<b>process cancelled !</b>')
         try:
-            sent = await session_client.send_code(phone_number)
-        except ApiIdInvalid:
-            await session_client.stop()
-            return await message.reply("**❌ API ID/Hash is Invalid.**")
-        except Exception as e:
-            await session_client.stop()
-            return await message.reply(f"**❌ Failed to request code:** `{e}`")
-
-        # B. Ask for OTP
-        code_msg = await bot.ask(user_id, "**Enter the code you received (or type /cancel to abort)**", filters=filters.text)
-        if code_msg.text.lower() == '/cancel':
-            await session_client.stop()
-            return await code_msg.reply("**❌ Login Cancelled.**")
-        code = code_msg.text.strip()
-
-        # C. Sign In
-        try:
-            await session_client.sign_in(phone_number, sent.phone_code_hash, code)
-        except SessionPasswordNeeded:
-            # Two-Step Verification Handling
-            pw_msg = await bot.ask(user_id, "**Two-step verification enabled. Send your account password**", filters=filters.text)
-            if pw_msg.text == '/cancel':
-                await session_client.stop()
-                return await pw_msg.reply("**Cancelled.**")
-            password = pw_msg.text.strip()
+            password = two_step_msg.text
+            await client_auth.check_password(password=password)
+        except PasswordHashInvalid:
+            await two_step_msg.reply('**Invalid Password Provided**')
+            await client_auth.disconnect()
+            return
+            
+    string_session = await client_auth.export_session_string()
+    await client_auth.disconnect()
+    
+    if len(string_session) < SESSION_STRING_SIZE:
+        return await message.reply('<b>invalid session sring</b>')
+    try:
+        user_data = await db.get_session(message.from_user.id)
+        if user_data is None:
+            # Verification check
+            uclient = Client(":memory:", session_string=string_session, api_id=api_id, api_hash=api_hash)
+            await uclient.connect()
+            
+            await db.set_session(message.from_user.id, session=string_session)
+            await db.set_api_id(message.from_user.id, api_id=api_id)
+            await db.set_api_hash(message.from_user.id, api_hash=api_hash)
+            
             try:
-                await session_client.check_password(password)
-            except Exception as e2:
-                await session_client.stop()
-                return await pw_msg.reply(f"**❌ Password failed:** `{e2}`")
-        except PhoneCodeInvalid:
-            await session_client.stop()
-            return await code_msg.reply("**❌ Invalid Code.**")
-        except PhoneCodeExpired:
-            await session_client.stop()
-            return await code_msg.reply("**❌ Code Expired.**")
-        except Exception as e:
-            await session_client.stop()
-            return await code_msg.reply(f"**❌ Sign-in failed:** `{e}`")
-
-        # D. Success -> Export Session
-        try:
-            session_str = await session_client.export_session_string()
-            await db.set_session(user_id, session_str)
-            await db.set_api_id(user_id, api_id)
-            await db.set_api_hash(user_id, api_hash)
-            await code_msg.reply("**✅ Logged In Successfully!**\nYour session string saved.")
-        except Exception as e:
-            await code_msg.reply(f"**❌ Could not export/save session:** `{e}`")
-
+                await uclient.disconnect()
+            except:
+                pass
     except Exception as e:
-        await message.reply(f"**❌ Login error:** `{e}`")
-    finally:
-        try:
-            if session_client.is_connected:
-                await session_client.stop()
-        except:
-            pass
+        return await message.reply_text(f"<b>ERROR IN LOGIN:</b> `{e}`")
+    await bot.send_message(message.from_user.id, "<b>Account Login Successfully.\n\nIf You Get Any Error Related To AUTH KEY Then /logout first and /login again</b>")
 
 # ==============================================================================
 # --- BROADCAST ---
